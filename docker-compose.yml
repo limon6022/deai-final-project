@@ -1,0 +1,98 @@
+services:
+
+  minio:
+    image: minio/minio:latest
+    container_name: taxi-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  ingestion:
+    build:
+      context: ./ingestion
+      dockerfile: Dockerfile
+    environment:
+      MINIO_ENDPOINT:    http://minio:9000
+      MINIO_ACCESS_KEY:  minioadmin
+      MINIO_SECRET_KEY:  minioadmin
+    depends_on:
+      minio:
+        condition: service_healthy
+
+  spark-master:
+    image: apache/spark:3.5.0
+    container_name: spark-master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    environment:
+      SPARK_MASTER_HOST: spark-master
+    ports:
+      - "7077:7077"
+      - "8080:8080"
+    volumes:
+      - ./processing:/opt/spark-apps
+
+  spark-worker:
+    image: apache/spark:3.5.0
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    environment:
+      SPARK_WORKER_MEMORY: 4g
+      SPARK_WORKER_CORES: "2"
+    depends_on:
+      - spark-master
+    volumes:
+      - ./processing:/opt/spark-apps
+
+  spark-job:
+    image: apache/spark:3.5.0
+    user: root
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /home/spark/.ivy2/cache /home/spark/.ivy2/jars
+        chmod -R 777 /home/spark/.ivy2
+        /opt/spark/bin/spark-submit \
+          --master spark://spark-master:7077 \
+          --packages org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262 \
+          --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000 \
+          --conf spark.hadoop.fs.s3a.access.key=minioadmin \
+          --conf spark.hadoop.fs.s3a.secret.key=minioadmin \
+          --conf spark.hadoop.fs.s3a.path.style.access=true \
+          /opt/spark-apps/pipeline.py
+    environment:
+      MINIO_ENDPOINT:    http://minio:9000
+      MINIO_ACCESS_KEY:  minioadmin
+      MINIO_SECRET_KEY:  minioadmin
+    depends_on:
+      - spark-master
+      - minio
+    volumes:
+      - ./processing:/opt/spark-apps
+
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: taxi-api
+    ports:
+      - "8000:8000"
+    environment:
+      MINIO_ENDPOINT:    http://minio:9000
+      MINIO_ACCESS_KEY:  minioadmin
+      MINIO_SECRET_KEY:  minioadmin
+    depends_on:
+      - minio
+
+volumes:
+  minio_data:
